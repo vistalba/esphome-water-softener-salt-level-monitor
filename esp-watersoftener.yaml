@@ -1,0 +1,394 @@
+substitutions:
+  name: esp32-watersoftener
+  friendly_name: "Water Softener"
+  api_key: !secret esp32-watersoftener_api_key
+
+esphome:
+  name: ${name}
+  name_add_mac_suffix: false
+  friendly_name: ${friendly_name}
+  on_boot:
+    - logger.log: "Water Softener starting up..."
+    - delay: 1s
+    - logger.log: "Device initialized successfully"
+
+# Homeassistant API
+api:
+  encryption:
+    key: ${api_key}
+  reboot_timeout: 600s
+  on_client_connected:
+    - logger.log: "Home Assistant connected"
+  on_client_disconnected:
+    - logger.log: "Home Assistant disconnected"
+
+# WiFi Settings
+wifi:
+  min_auth_mode: WPA3
+  enable_btm: True
+  enable_rrm: True
+  networks:
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
+  reboot_timeout: 5min
+  # fast_connect: true
+  # power_save_mode: LIGHT
+  # output_power: 17dB
+
+  # Fallback access point
+  ap:
+    ssid: "${friendly_name} Access Point"
+    password: !secret fallback_password
+    ap_timeout: 3min
+
+captive_portal:
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+    version: recommended
+
+# Enable logging
+logger:
+  level: DEBUG
+  logs:
+    component: WARN
+    wifi: INFO
+    i2c: DEBUG
+
+# OTA Settings
+ota:
+  - platform: esphome
+    password: !secret ota_password
+    on_begin:
+      - logger.log: "OTA update starting..."
+    on_progress:
+      - logger.log:
+          format: "OTA Progress: %.1f%%"
+          args: ['x']
+    on_end:
+      - logger.log: "OTA update completed successfully"
+    on_error:
+      - logger.log: "OTA Error occurred"
+
+safe_mode:
+
+# Time Settings
+time:
+  - platform: homeassistant
+    id: homeassistant_time
+    on_time_sync:
+      - logger.log: "Time synchronized with Home Assistant"
+
+# VL53L0x Distance Sensor Configuration
+i2c:
+  - id: bus_a
+    sda: GPIO2
+    scl: GPIO1
+    frequency: 400kHz
+    scan: true
+    timeout: 100us
+
+globals:
+  - id: last_restart_time
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: empty_error_state
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+
+button:
+  - platform: safe_mode
+    name: Safe Mode Boot
+    entity_category: diagnostic
+    disabled_by_default: false
+    icon: mdi:restart-alert
+    device_class: restart
+  - platform: restart
+    name: Restart
+    id: restart_button
+    entity_category: diagnostic
+    disabled_by_default: false
+    icon: mdi:restart
+    device_class: restart
+    on_press:
+      - if:
+          condition:
+            lambda: 'return millis() - id(last_restart_time) > 30000;'  # 30 second cooldown
+          then:
+            - globals.set:
+                id: last_restart_time
+                value: !lambda 'return millis();'
+            - button.press: restart_button
+          else:
+            - logger.log: "Restart cooldown active. Please wait..."
+
+  - platform: template
+    name: "Calibrate Empty"
+    id: calibrate_empty
+    entity_category: config
+    icon: mdi:water-off-outline
+    on_press:
+      - number.set:
+          id: empty_distance
+          value: !lambda 'return id(distance_sensor).state;'
+      - logger.log: "Empty distance calibrated!"
+  - platform: template
+    name: "Calibrate Full"
+    id: calibrate_full
+    entity_category: config
+    icon: mdi:water-outline
+    on_press:
+      - number.set:
+          id: full_distance
+          value: !lambda 'return id(distance_sensor).state;'
+      - logger.log: "Full distance calibrated!"
+
+number:
+  - platform: template
+    name: "Empty Distance"
+    id: empty_distance
+    min_value: 0
+    max_value: 1000
+    initial_value: 530
+    step: 5
+    unit_of_measurement: "mm"
+    device_class: distance
+    entity_category: config
+    icon: mdi:water-off
+    optimistic: true
+    restore_value: true
+    set_action:
+      - lambda: |-
+          if (x <= id(full_distance).state) {
+            ESP_LOGW("validation", "Empty distance must be greater than full distance!");
+            return;
+          }
+          ESP_LOGI("config", "Empty distance set to: %.0f mm", x);
+
+  - platform: template
+    name: "Full Distance"
+    id: full_distance
+    min_value: 0
+    max_value: 1000
+    initial_value: 60
+    step: 5
+    unit_of_measurement: "mm"
+    device_class: distance
+    entity_category: config
+    icon: mdi:water
+    optimistic: true
+    restore_value: true
+    set_action:
+      - lambda: |-
+          if (x >= id(empty_distance).state) {
+            ESP_LOGW("validation", "Full distance must be less than empty distance!");
+            return;
+          }
+          ESP_LOGI("config", "Full distance set to: %.0f mm", x);
+
+  - platform: template
+    name: "Salt Warning Threshold"
+    id: salt_warning_threshold
+    min_value: 5
+    max_value: 50
+    initial_value: 20
+    step: 5
+    unit_of_measurement: "%"
+    entity_category: config
+    icon: mdi:alert-circle-outline
+    optimistic: true
+    restore_value: true
+
+  - platform: template
+    name: "Salt Warning Reset Hysteresis"
+    id: salt_warning_hysteresis
+    min_value: 5
+    max_value: 30
+    initial_value: 10
+    step: 5
+    unit_of_measurement: "%"
+    entity_category: config
+    icon: mdi:arrow-collapse-vertical
+    optimistic: true
+    restore_value: true
+
+binary_sensor:
+  - platform: template
+    name: "Salt Empty Error"
+    id: salt_empty_error
+    device_class: problem
+    icon: mdi:alert-circle
+    lambda: |-
+      return id(empty_error_state);
+
+sensor:
+  - platform: vl53l0x
+    name: "VL53L0x Distance"
+    id: distance_sensor
+    address: 0x29
+    update_interval: 60s
+    long_range: false
+    signal_rate_limit: 0.25
+    timing_budget: 30000000us
+    timeout: 10ms
+    unit_of_measurement: "mm"
+    device_class: distance
+    state_class: measurement
+    accuracy_decimals: 0
+    filters:
+      - heartbeat:
+          period: 600s
+          optimistic: true
+      - sliding_window_moving_average:
+          window_size: 5
+          send_every: 1
+          send_first_at: 1
+      - multiply: 1000
+      - round: 0
+    on_value:
+      - lambda: |-
+          float distance = x;
+          if (isnan(distance)) return;
+
+          float full  = id(full_distance).state;
+          float empty = id(empty_distance).state;
+          float threshold_pct  = id(salt_warning_threshold).state;
+          float hysteresis_pct = id(salt_warning_hysteresis).state;
+          bool  currently_error = id(empty_error_state);
+
+          // Füllstand berechnen (identische Formel wie Fill Level Sensor)
+          float percent = 100.0f * (empty - distance) / (empty - full);
+          if (percent < 0.0f)   percent = 0.0f;
+          if (percent > 100.0f) percent = 100.0f;
+
+          if (!currently_error && percent <= threshold_pct) {
+            // Alarm auslösen
+            id(empty_error_state) = true;
+            id(salt_empty_error).publish_state(true);
+            ESP_LOGW("salt", "Salt low! Fill: %.1f%% <= Threshold: %.1f%%", percent, threshold_pct);
+          }
+          else if (currently_error && percent >= (threshold_pct + hysteresis_pct)) {
+            // Alarm zurücksetzen (erst wenn Füllstand Threshold + Hysterese überschreitet)
+            id(empty_error_state) = false;
+            id(salt_empty_error).publish_state(false);
+            ESP_LOGI("salt", "Salt refilled! Fill: %.1f%% >= Reset: %.1f%%",
+                     percent, threshold_pct + hysteresis_pct);
+          }
+
+  - platform: template
+    name: "Fill Level"
+    id: fill_level_percent
+    unit_of_measurement: "%"
+    device_class: "battery"
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: 30s
+    lambda: |-
+      float raw = id(distance_sensor).state;
+      if (isnan(raw)) {
+        return {};
+      }
+      float full  = id(full_distance).state;
+      float empty = id(empty_distance).state;
+      float percent = 100.0f * (empty - raw) / (empty - full);
+      if (percent < 0.0f)   percent = 0.0f;
+      if (percent > 100.0f) percent = 100.0f;
+      return percent;
+
+  # System temperature
+  - platform: internal_temperature
+    name: "ESP32 Temperature"
+    id: esp_temp
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    disabled_by_default: true
+    update_interval: 60s
+    filters:
+      - offset: 0
+      - round: 1
+    on_value_range:
+      - above: 75.0
+        then:
+          - logger.log: "⚠️ Temperature warning: Device too hot!"
+      - above: 80.0
+        then:
+          - logger.log: "🔥 Critical temperature! Restarting..."
+          - button.press: restart_button
+
+  # WiFi signal strength
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    id: wifi_signal_rssi
+    unit_of_measurement: "dBm"
+    device_class: signal_strength
+    state_class: measurement
+    disabled_by_default: true
+    update_interval: 60s
+    filters:
+      - sliding_window_moving_average:
+          window_size: 5
+
+  # Uptime
+  - platform: uptime
+    name: "Uptime"
+    id: uptime_sensor
+    unit_of_measurement: "s"
+    state_class: total_increasing
+    disabled_by_default: true
+    update_interval: 60s
+
+  # Free heap memory
+  - platform: template
+    name: "Free Heap"
+    id: free_heap
+    unit_of_measurement: "bytes"
+    entity_category: diagnostic
+    state_class: measurement
+    disabled_by_default: true
+    update_interval: 60s
+    lambda: |-
+      return heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+
+# Text sensors for diagnostics
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
+      entity_category: diagnostic
+      disabled_by_default: true
+    ssid:
+      name: "Connected SSID"
+      entity_category: diagnostic
+      disabled_by_default: true
+    bssid:
+      name: "WiFi MAC"
+      entity_category: diagnostic
+      disabled_by_default: true
+  - platform: template
+    name: "Last Update"
+    id: last_update
+    entity_category: diagnostic
+    disabled_by_default: true
+    update_interval: 60s
+    lambda: |-
+      auto now = id(homeassistant_time).now();
+      if (!now.is_valid()) {
+        return std::string("Unknown");
+      }
+      char buffer[20];
+      struct tm timeinfo = now.to_c_tm();
+      strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &timeinfo);
+      return std::string(buffer);
+
+# Bluetooth Proxy
+esp32_ble_tracker:
+  scan_parameters:
+    active: true
+
+bluetooth_proxy:
+  active: true
